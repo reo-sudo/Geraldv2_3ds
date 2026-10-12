@@ -1,0 +1,116 @@
+name: Build Gerald CIA
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Only checkout is needed. No write token or repository secrets required.
+permissions:
+  contents: read
+
+# Prevent stale builds from uploading artifacts after a newer commit.
+concurrency:
+  group: gerald-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile and package Nintendo 3DS game
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: devkitpro/devkitarm:20260610
+      options: --user 0:0
+
+    steps:
+      - name: Checkout Gerald source
+        uses: actions/checkout@v4
+
+      - name: Check required files and devkitPro toolchain
+        run: |
+          set -euo pipefail
+          echo "DEVKITPRO=${DEVKITPRO:-<missing>}"
+          echo "DEVKITARM=${DEVKITARM:-<missing>}"
+          test -n "${DEVKITPRO:-}" || { echo 'DEVKITPRO is missing' >&2; exit 1; }
+          test -n "${DEVKITARM:-}" || { echo 'DEVKITARM is missing' >&2; exit 1; }
+          test -f "$DEVKITARM/3ds_rules" || { echo '3ds_rules is missing' >&2; exit 1; }
+          for file in Makefile app.rsf source/main.c \
+                      meta/banner.png meta/banner.wav meta/icon.png \
+                      tools/check_assets.py tools/build_cia.sh tools/install_cia_tools.sh; do
+            test -s "$file" || { echo "Required file missing or empty: $file" >&2; exit 1; }
+          done
+          command -v make
+          command -v python3
+          command -v cmake
+          command -v arm-none-eabi-gcc
+          arm-none-eabi-gcc --version | head -1
+
+      - name: Validate sprite, banner, audio and scripts
+        run: |
+          set -euo pipefail
+          python3 -B tools/check_assets.py
+          bash -n tools/build_cia.sh tools/install_cia_tools.sh
+          python3 -B -m compileall -q tools/check_assets.py tools/gen_assets.py tools/verify_outputs.py
+
+      - name: Compile Gerald from clean source
+        run: |
+          set -euo pipefail
+          make clean
+          make -j2 2>&1 | tee build.log
+          test -s gerald.elf
+          test -s gerald.3dsx
+          test -s gerald.smdh
+
+      - name: Install CIA packaging utilities
+        run: |
+          set -euo pipefail
+          bash tools/install_cia_tools.sh 2>&1 | tee install-tools.log
+          command -v makerom
+          command -v bannertool
+
+      - name: Package CIA with icon, banner and jingle
+        run: |
+          set -euo pipefail
+          bash tools/build_cia.sh 2>&1 | tee package.log
+
+      - name: Verify actual binary headers and checksums
+        run: |
+          set -euo pipefail
+          python3 -B tools/verify_outputs.py
+          (cd dist && sha256sum gerald.cia gerald.3dsx > SHA256SUMS)
+          cat dist/SHA256SUMS
+          {
+            echo '### Gerald Pondside Deluxe — Build passed'
+            echo 'Outputs: `gerald.cia` and `gerald.3dsx`.'
+            echo ''
+            echo 'Both files passed header, size and source-asset checks.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload finished 3DS game
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gerald-Pondside-Deluxe-3DS
+          path: |
+            dist/gerald.cia
+            dist/gerald.3dsx
+            dist/banner.png
+            dist/icon.png
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs if something failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gerald-build-logs
+          path: |
+            build.log
+            install-tools.log
+            package.log
+          if-no-files-found: warn
+          retention-days: 7
